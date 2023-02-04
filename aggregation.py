@@ -1,13 +1,14 @@
 import numpy as np
 import cv2
+import os
 
 
 class Aggregator:
-    def __init__(self):
-        pass
+    def __init__(self, cls):
+        self.cls = cls
 
-    def aggregate(self, clip_aedat, start, end, size_kz= (480, 640)):
-        image = np.zeros(size_kz)
+    def aggregate(self, clip_aedat, start, end, size_kz=(480, 640)):
+        image = np.zeros(size_kz) + 0.5
         agg = clip_aedat[clip_aedat['timestamp'] < end]
         agg = agg[agg['timestamp'] >= start]
 
@@ -40,10 +41,12 @@ class Aggregator:
         # Apply thresholding
         _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
 
+        # plt.imshow(thresh)
+
         return thresh
 
     @staticmethod
-    def blobbing(image, min_threshold = 1, max_threshold = 255, filter_by_ares = True, minArea = 1):
+    def blobbing(image, min_threshold=1, max_threshold=255, filter_by_areas=True, minArea=1):
         # Detect blobs
         params = cv2.SimpleBlobDetector_Params()
 
@@ -52,7 +55,7 @@ class Aggregator:
         params.maxThreshold = max_threshold
 
         # Filter by Area.
-        params.filterByArea = filter_by_ares
+        params.filterByArea = filter_by_areas
         params.minArea = minArea
 
         detector = cv2.SimpleBlobDetector_create(params)
@@ -63,7 +66,7 @@ class Aggregator:
         return pts
 
     @staticmethod
-    def rescale_coords(x, w, y, h, source_res:tuple, target_res:tuple):
+    def rescale_coords(x, w, y, h, source_res: tuple, target_res: tuple):
         """
 
         :param x: coord x
@@ -121,70 +124,211 @@ class Aggregator:
         return frames
 
     @staticmethod
-    def resize_and_append(agg_frame, mp4_frames, size:tuple):
-        resized = []
+    def resize_and_append(agg_frame, mp4_frames, size: tuple):
+        resized_mp4 = []
         # resized
         resized_agg = cv2.resize(agg_frame, size)
+        # result = np.repeat(resized_agg[np.newaxis, ...], len(mp4_frames), axis=0)
+        # print(len(mp4_frames))
         for frame in mp4_frames:
-            resized.append([resized_agg, cv2.resize(frame, size)])
+            # resized.append([resized_agg, cv2.resize(frame, size)])
+            resized_mp4.append(cv2.resize(frame, size))
 
-        return resized
+        return resized_agg, np.stack(resized_mp4)
 
-    def find_and_rescale(self, clip_aedat_path, clip_mp4_path, aggreg_duration, time_diff,
+    def find_and_rescale(self, clip_numpy_path, clip_mp4_path, aggreg_duration, time_diff,
                          size_kz=(480, 640), size_mp4=(1080, 1980)):
+        """
+        Agreguje, klatki z kz i szuka odpowiadających klatek z mp4
+        :param clip_numpy_path: ścieżka klipu np
+        :param clip_mp4_path:  ścieżka klipu mp4
+        :param aggreg_duration: czas agregacji w sekundach
+        :param time_diff: opóźnienie w sekundach
+        :param size_kz: rozdzielczośc kz
+        :param size_mp4: rozdzielczość mp4
+        :return: Zwraca zbiory obrazów dla danego klipu
+        """
 
-        output = {}
-        clip_aedat = np.load(clip_aedat_path)
+        # outputy
+        images_64_64_kz = []
+        images_64_64_kz_y = []
+
+        images_64_64_mp4 = []
+        images_64_64_mp4_y = []
+
+        images_32_32_kz = []
+        images_32_32_kz_y = []
+
+        images_32_32_mp4 = []
+        images_32_32_mp4_y = []
+
+        clip = np.load(clip_numpy_path)
 
         # #
-        k = 1000000 # mikrosekund w sekundzie
+        k = 1000000  # mikrosekund w sekundzie
         # #
-        images = {}
+        # images = {}
         # start klipu
-        start = clip_aedat['timestamp'][0]
+        start = clip['timestamp'][0]
 
         # długośc klipu aedat4
-        clip_length = clip_aedat['timestmap'][-1] - start
+        clip_length = clip['timestamp'][-1] - start
 
         # ile klatek można zagregować
-        n_frames = clip_length // aggreg_duration * k
+        n_frames = int(clip_length / (aggreg_duration * k))
+        print(f'..Do agregacji {n_frames} klatki')
 
         # pierwsza wartość końcowa
         end = start + aggreg_duration * k
 
         for i in range(n_frames):
-            image = self.aggregate(clip_aedat, start, end)
-
+            print(f'..Agregacja {i} klatki')
+            image = self.aggregate(clip, start, end)
+            print(f'..Processing {i} klatki')
             image = self.processing(image)
 
+            print(f'..Blobbing {i} klatki')
             pts = self.blobbing(image)
+            if len(pts) != 0:
+                # ROI z kz i cropped image
+                x, y, h, w = cv2.boundingRect(pts)
+                cropped = image[y:y + h, x:x + w]
+            else:
+                print('Nie znaleziono blobów')
+                continue
 
-            # ROI i cropped image
-            x, y, h, w = cv2.boundingRect(pts)
-            cropped = image[y:y + h, x:x + w]
-
+            print(f'..Skalowanie koordynat {i} klatki')
             # przeskalowane koordynaty
-            scaled_x, scaled_w, scaled_y, scaled_h = self.rescale_coords(x,w,y,h, size_kz, size_mp4)
+            scaled_x, scaled_w, scaled_y, scaled_h = self.rescale_coords(x, w, y, h, size_kz, size_mp4)
 
-            # dodaj do listy wycięcie z kz
-            # images.append(cropped)
-
+            print(f'..Wycinanie klatek z mp4 dla {i} klatki')
             # klatki z mp4 odpowiadające zagregowanym klatkom kz
-            frames = self.cut_frames_from_mp4(clip_mp4_path, (i+1) * aggreg_duration + time_diff, aggreg_duration)
+            frames = self.cut_frames_from_mp4(clip_mp4_path, i * aggreg_duration + time_diff, aggreg_duration)
 
-            # cropping
-            frames = [frame[scaled_y:scaled_y+scaled_h, scaled_x:scaled_h+scaled_w] for frame in frames]
+            # cropping klatek mp4 przeskalowanymi koordynatami
+            frames = [frame[scaled_y:scaled_y + scaled_h, scaled_x:scaled_x + scaled_w] for frame in frames]
+            if len(frames) == 0:
+                print('Brak klatek.')
+                continue
+            # print(len(frames))
 
-            images_64x64 = self.resize_and_append(cropped, frames, (64, 64))
-            images_32x32 = self.resize_and_append(cropped, frames, (32, 32))
+            # RESIZE
+            print(f'..Resize {i} klatki')
+            resized_kz_64, images_mp4_64x64 = self.resize_and_append(cropped, frames, (64, 64))
+            resized_kz_32, images_mp4_32x32 = self.resize_and_append(cropped, frames, (32, 32))
+            #
 
-            images[cropped] = [images_64x64, images_32x32]
+            #### outputy
+
+            # lista obrazków z kz 64x64
+            images_64_64_kz.append(resized_kz_64)
+            images_64_64_kz_y.append(i)
+
+            # lista klatek z mp4 64x64
+            images_64_64_mp4.append(images_mp4_64x64)
+            for x in range(len(images_mp4_64x64)):
+                images_64_64_mp4_y.append(i)
+
+            # lista obrazków z kz 32x32
+            images_32_32_kz.append(resized_kz_32)
+            images_32_32_kz_y.append(i)
+
+            # lista klatek z mp4 32x32
+            images_32_32_mp4.append(images_mp4_32x32)
+            for x in range(len(images_mp4_32x32)):
+                images_32_32_mp4_y.append(i)
+
             ####
 
             # przejdź do nastepnych wycięć
             start = end
             end += aggreg_duration * k
 
-        return images
+        # v stack żeby uzyskać odpowiedni rozmiar
+        images_64_64_mp4 = np.vstack(images_64_64_mp4)
+
+        images_32_32_mp4 = np.vstack(images_32_32_mp4)
+
+        return np.stack(images_64_64_kz), \
+               np.stack(images_64_64_kz_y), \
+               images_64_64_mp4, \
+               np.stack(images_64_64_mp4_y), \
+               np.stack(images_32_32_kz), \
+               np.stack(images_32_32_kz_y), \
+               images_32_32_mp4, \
+               np.stack(images_32_32_mp4_y)
 
 
+def search_directory(numpy_directory: str, mp4_directory: str, count_start, count_stop, aggregator: Aggregator,
+                     agg_duration=1, time_diff=1):
+    """
+
+    :param numpy_directory: folder z numpyowskimi klipami
+    :param mp4_directory: folder z klipami mp4
+    :param aggregator: agregator użyty
+    :param agg_duration: czas trwania agregacji z kz, domyślnie 1 sec
+    :param time_diff: czas opóźnienia między kamerami, powinno być 0 sec ale czasami 1 sec potrzebna
+    :return: zwraca 4 zbiory obrazów, zagregowane kz dla 64x64, 32x32 i klatki z klipów mp4 dla 64x64 i 32x32.
+    Dodatkowo zwraca odpowiadające im zbiory y które określają przynależność do zagregowanych przedziałów dla klipów np.
+    0 - przedział od 0 do 1 sekundy
+    1 - przedział od 1 do 2 sekundy itd.
+    """
+    numpy_paths = []
+    mp4_paths = []
+    # tworzenie 4 zbiorów wraz z odpowiadającymi im czasami agregacji
+    x_64_64_kz_data, y_64_64_kz_data, x_64_64_mp4_data, y_64_64_mp4_data, \
+    x_32_32_kz_data, y_32_32_kz_data, x_32_32_mp4_data, y_32_32_mp4_data = [], [], [], [], [], [], [], []
+
+    for filename in os.listdir(numpy_directory):
+        file_path = os.path.join(numpy_directory, filename)
+        numpy_paths.append(file_path)
+
+    for filename in os.listdir(mp4_directory):
+        file_path = os.path.join(mp4_directory, filename)
+        mp4_paths.append(file_path)
+
+    # n = len(numpy_paths)
+    n = count_stop - count_start
+    i = 0
+    for np_path, mp4_path in zip(numpy_paths[count_start:count_stop], mp4_paths[count_start:count_stop]):
+        print(f'Agregacja dla pliku {np_path} i {mp4_path}.\nJeszcze {n - i - 1} plików.. ')
+        x_64_64_kz, y_64_64_kz, x_64_64_mp4, y_64_64_mp4, x_32_32_kz, y_32_32_kz, x_32_32_mp4, y_32_32_mp4 = \
+            aggregator.find_and_rescale(np_path, mp4_path, agg_duration, time_diff)
+
+        x_64_64_kz_data.append(x_64_64_kz)
+        y_64_64_kz_data.append(y_64_64_kz)
+
+        x_32_32_kz_data.append(x_32_32_kz)
+        y_32_32_kz_data.append(y_32_32_kz)
+
+        x_64_64_mp4_data.append(x_64_64_mp4)
+        y_64_64_mp4_data.append(y_64_64_mp4)
+
+        x_32_32_mp4_data.append(x_32_32_mp4)
+        y_32_32_mp4_data.append(y_32_32_mp4)
+
+        i += 1
+
+    # konwersja do numpy array
+
+    # stack
+    x_64_64_kz_data = np.vstack(x_64_64_kz_data)
+    y_64_64_kz_data = np.hstack(y_64_64_kz_data)
+
+    x_32_32_kz_data = np.vstack(x_32_32_kz_data)
+    y_32_32_kz_data = np.hstack(y_32_32_kz_data)
+
+    x_64_64_mp4_data = np.vstack(x_64_64_mp4_data)
+    y_64_64_mp4_data = np.hstack(y_64_64_mp4_data)
+
+    x_32_32_mp4_data = np.vstack(x_32_32_mp4_data)
+    y_32_32_mp4_data = np.hstack(y_32_32_mp4_data)
+
+    return x_64_64_kz_data, \
+           y_64_64_kz_data, \
+           x_32_32_kz_data, \
+           y_32_32_kz_data, \
+           x_64_64_mp4_data, \
+           y_64_64_mp4_data, \
+           x_32_32_mp4_data, \
+           y_32_32_mp4_data
